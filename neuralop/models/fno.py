@@ -76,7 +76,7 @@ class FNO(BaseModel, name="FNO"):
     norm : Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm"], optional
         Normalization layer to use. Options: "ada_in", "batch_ada_in", "group_norm", "instance_norm", None. Default: None
         "ada_in" applies a single adaptive-norm embedding to every sample in the batch.
-        "batch_ada_in" accepts one embedding per sample (shape (batch, ada_in_dim) for
+        "batch_ada_in" accepts one embedding per sample (shape (batch, ada_in_input_dim) for
         `ada_in` in `forward`), so adaptive-norm parameters can vary across the batch.
     norm_groups : int, optional
         Number of groups for GroupNorm, by default 1
@@ -140,13 +140,13 @@ class FNO(BaseModel, name="FNO"):
         Extra kwargs for tensor decomposition (see `tltorch.FactorizedTensor`). Default: {}
     separable : bool, optional
         Whether to use a separable spectral convolution. Default: False
-    ada_in_dim : int, optional
+    ada_in_input_dim : int, optional
         If adaptive norm is used (norm = 'ada_in'), number of input channels for the adaptive mesh. Default: 1
     ada_in_pos_embed_type : str, optional
         Type of positional embedding to use for adaptive norm. Default: None
         If None, no positional embedding is used for the adaptive norm, input is used as embedding.
-    ada_embed_frequencies: int, optional
-        If an adaptive norm (ada_in_dim) is used with a positional embedding (ada_in_pos_embed_type),
+    ada_in_embed_frequencies: int, optional
+        If an adaptive norm (ada_in_input_dim) is used with a positional embedding (ada_in_pos_embed_type),
         number of channels of its positional embedding. If None, no positional embedding is used for
         the adaptive norm, input is used as embedding. Default: 4
     preactivation : bool, optional
@@ -218,9 +218,9 @@ class FNO(BaseModel, name="FNO"):
         implementation: str = "factorized",
         decomposition_kwargs: dict = None,
         separable: bool = False,
-        ada_in_dim: Union[int, None] = 1,
+        ada_in_input_dim: Union[int, None] = 1,
         ada_in_pos_embed_type: Union[str, None] = None,
-        ada_embed_frequencies: Union[int, None] = 4,
+        ada_in_embed_frequencies: Union[int, None] = 4,
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
@@ -305,20 +305,23 @@ class FNO(BaseModel, name="FNO"):
 
         self.norm = norm
         if self.norm in ("ada_in", "batch_ada_in"):
-            if ada_embed_frequencies is not None and ada_in_pos_embed_type is not None:
-                self.adain_pos_embed = SinusoidalEmbedding(
-                    in_channels=ada_in_dim,
-                    num_frequencies=ada_embed_frequencies,
+            if (
+                ada_in_embed_frequencies is not None
+                and ada_in_pos_embed_type is not None
+            ):
+                self.ada_in_pos_embed = SinusoidalEmbedding(
+                    in_channels=ada_in_input_dim,
+                    num_frequencies=ada_in_embed_frequencies,
                     max_positions=10000,
                     embedding_type=ada_in_pos_embed_type,
                 )
-                self.ada_embed_dim = self.adain_pos_embed.out_channels
+                self.ada_in_embed_dim = self.ada_in_pos_embed.out_channels
             else:
-                self.ada_embed_dim = ada_in_dim
-                self.adain_pos_embed = None
+                self.ada_in_embed_dim = ada_in_input_dim
+                self.ada_in_pos_embed = None
         else:
-            self.adain_pos_embed = None
-            self.ada_embed_dim = None
+            self.ada_in_pos_embed = None
+            self.ada_in_embed_dim = None
 
         ## FNO blocks
         self.fno_blocks = FNOBlocks(
@@ -333,7 +336,7 @@ class FNO(BaseModel, name="FNO"):
             stabilizer=stabilizer,
             norm=norm,
             norm_groups=norm_groups,
-            ada_in_features=self.ada_embed_dim,
+            ada_in_features=self.ada_in_embed_dim,
             preactivation=preactivation,
             fno_skip=fno_skip,
             conv_bias_kernel=conv_bias_kernel,
@@ -432,13 +435,13 @@ class FNO(BaseModel, name="FNO"):
             x = self.domain_padding.pad(x)
 
         if self.norm in ("ada_in", "batch_ada_in"):
-            if self.adain_pos_embed is not None:
+            if self.ada_in_pos_embed is not None:
                 if ada_in.ndim == 1:
                     # single embedding shared across every sample in the batch
-                    ada_in_embed = self.adain_pos_embed(ada_in.unsqueeze(0)).squeeze(0)
+                    ada_in_embed = self.ada_in_pos_embed(ada_in.unsqueeze(0)).squeeze(0)
                 else:
-                    # one embedding per sample, shape (batch, ada_in_dim)
-                    ada_in_embed = self.adain_pos_embed(ada_in)
+                    # one embedding per sample, shape (batch, ada_in_input_dim)
+                    ada_in_embed = self.ada_in_pos_embed(ada_in)
             else:
                 ada_in_embed = ada_in
             self.fno_blocks.set_ada_in_embeddings(ada_in_embed)

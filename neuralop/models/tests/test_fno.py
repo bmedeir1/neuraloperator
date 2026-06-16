@@ -318,9 +318,9 @@ def test_fno_ada_in(norm, ada_in_pos_embed_type):
         hidden_channels=hidden_channels,
         n_layers=n_layers,
         norm=norm,
-        ada_in_dim=ada_in_dim,
+        ada_in_input_dim=ada_in_dim,
         ada_in_pos_embed_type=ada_in_pos_embed_type,
-        ada_embed_frequencies=4,
+        ada_in_embed_frequencies=4,
     ).to(device)
 
     in_data = torch.randn(batch_size, 3, *size).to(device)
