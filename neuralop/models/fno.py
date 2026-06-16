@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings("once", category=UserWarning)
 
 
-from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D
+from ..layers.embeddings import GridEmbeddingND, GridEmbedding2D, SinusoidalEmbedding
 from ..layers.spectral_convolution import SpectralConv
 from ..layers.padding import DomainPadding
 from ..layers.fno_block import FNOBlocks
@@ -73,8 +73,11 @@ class FNO(BaseModel, name="FNO"):
         Default: "grid"
     non_linearity : nn.Module, optional
         Non-Linear activation function module to use. Default: F.gelu
-    norm : Literal["ada_in", "group_norm", "instance_norm"], optional
-        Normalization layer to use. Options: "ada_in", "group_norm", "instance_norm", None. Default: None
+    norm : Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm"], optional
+        Normalization layer to use. Options: "ada_in", "batch_ada_in", "group_norm", "instance_norm", None. Default: None
+        "ada_in" applies a single adaptive-norm embedding to every sample in the batch.
+        "batch_ada_in" accepts one embedding per sample (shape (batch, ada_in_dim) for
+        `ada_in` in `forward`), so adaptive-norm parameters can vary across the batch.
     norm_groups : int, optional
         Number of groups for GroupNorm, by default 1
     complex_data : bool, optional
@@ -137,6 +140,15 @@ class FNO(BaseModel, name="FNO"):
         Extra kwargs for tensor decomposition (see `tltorch.FactorizedTensor`). Default: {}
     separable : bool, optional
         Whether to use a separable spectral convolution. Default: False
+    ada_in_dim : int, optional
+        If adaptive norm is used (norm = 'ada_in'), number of input channels for the adaptive mesh. Default: 1
+    ada_in_pos_embed_type : str, optional
+        Type of positional embedding to use for adaptive norm. Default: None
+        If None, no positional embedding is used for the adaptive norm, input is used as embedding.
+    ada_embed_frequencies: int, optional
+        If an adaptive norm (ada_in_dim) is used with a positional embedding (ada_in_pos_embed_type),
+        number of channels of its positional embedding. If None, no positional embedding is used for
+        the adaptive norm, input is used as embedding. Default: 4
     preactivation : bool, optional
         Whether to compute FNO forward pass with resnet-style preactivation. Default: False
     conv_module : nn.Module, optional
@@ -184,13 +196,15 @@ class FNO(BaseModel, name="FNO"):
         projection_channel_ratio: Number = 2,
         positional_embedding: Union[str, nn.Module] = "grid",
         non_linearity: nn.Module = F.gelu,
-        norm: Literal["ada_in", "group_norm", "instance_norm"] = None,
+        norm: Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm"] = None,
         norm_groups: int = 1,
         complex_data: bool = False,
         use_channel_mlp: bool = True,
         channel_mlp_dropout: float = 0,
         channel_mlp_expansion: float = 0.5,
-        channel_mlp_skip: Literal["linear", "identity", "soft-gating", None] = "soft-gating",
+        channel_mlp_skip: Literal[
+            "linear", "identity", "soft-gating", None
+        ] = "soft-gating",
         fno_skip: Literal["linear", "identity", "soft-gating", None] = "linear",
         conv_bias_kernel: int = 1,
         resolution_scaling_factor: Union[Number, List[Number]] = None,
@@ -204,6 +218,9 @@ class FNO(BaseModel, name="FNO"):
         implementation: str = "factorized",
         decomposition_kwargs: dict = None,
         separable: bool = False,
+        ada_in_dim: Union[int, None] = 1,
+        ada_in_pos_embed_type: Union[str, None] = None,
+        ada_embed_frequencies: Union[int, None] = 4,
         preactivation: bool = False,
         conv_module: nn.Module = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
@@ -286,6 +303,23 @@ class FNO(BaseModel, name="FNO"):
                 resolution_scaling_factor = [resolution_scaling_factor] * self.n_layers
         self.resolution_scaling_factor = resolution_scaling_factor
 
+        self.norm = norm
+        if self.norm in ("ada_in", "batch_ada_in"):
+            if ada_embed_frequencies is not None and ada_in_pos_embed_type is not None:
+                self.adain_pos_embed = SinusoidalEmbedding(
+                    in_channels=ada_in_dim,
+                    num_frequencies=ada_embed_frequencies,
+                    max_positions=10000,
+                    embedding_type=ada_in_pos_embed_type,
+                )
+                self.ada_embed_dim = self.adain_pos_embed.out_channels
+            else:
+                self.ada_embed_dim = ada_in_dim
+                self.adain_pos_embed = None
+        else:
+            self.adain_pos_embed = None
+            self.ada_embed_dim = None
+
         ## FNO blocks
         self.fno_blocks = FNOBlocks(
             in_channels=hidden_channels,
@@ -299,6 +333,7 @@ class FNO(BaseModel, name="FNO"):
             stabilizer=stabilizer,
             norm=norm,
             norm_groups=norm_groups,
+            ada_in_features=self.ada_embed_dim,
             preactivation=preactivation,
             fno_skip=fno_skip,
             conv_bias_kernel=conv_bias_kernel,
@@ -345,7 +380,7 @@ class FNO(BaseModel, name="FNO"):
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
 
-    def forward(self, x, output_shape=None, **kwargs):
+    def forward(self, x, output_shape=None, ada_in=None, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -395,6 +430,18 @@ class FNO(BaseModel, name="FNO"):
 
         if self.domain_padding is not None:
             x = self.domain_padding.pad(x)
+
+        if self.norm in ("ada_in", "batch_ada_in"):
+            if self.adain_pos_embed is not None:
+                if ada_in.ndim == 1:
+                    # single embedding shared across every sample in the batch
+                    ada_in_embed = self.adain_pos_embed(ada_in.unsqueeze(0)).squeeze(0)
+                else:
+                    # one embedding per sample, shape (batch, ada_in_dim)
+                    ada_in_embed = self.adain_pos_embed(ada_in)
+            else:
+                ada_in_embed = ada_in
+            self.fno_blocks.set_ada_in_embeddings(ada_in_embed)
 
         for layer_idx in range(self.n_layers):
             x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])

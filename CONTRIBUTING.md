@@ -55,6 +55,7 @@ Thank you for contributing to NeuralOperator! Your contributions help make this 
    # OR
    pip install neuraloperator[dev]
    ```
+   > **Note (zsh users)**: zsh treats `[dev]` as a glob pattern and will fail with `no matches found`. Quote the argument instead: `pip install -e ".[dev]"`.
 
 
 &nbsp;

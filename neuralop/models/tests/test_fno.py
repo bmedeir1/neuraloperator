@@ -132,10 +132,14 @@ def test_fno_superresolution(resolution_scaling_factor):
 
 @pytest.mark.parametrize("norm", [None, "group_norm", "instance_norm"])
 @pytest.mark.parametrize("use_channel_mlp", [True, False])
-@pytest.mark.parametrize("channel_mlp_skip", ["linear", "identity", "soft-gating", None])
+@pytest.mark.parametrize(
+    "channel_mlp_skip", ["linear", "identity", "soft-gating", None]
+)
 @pytest.mark.parametrize("fno_skip", ["linear", "identity", "soft-gating", None])
 @pytest.mark.parametrize("complex_data", [True, False])
-def test_fno_advanced_params(norm, use_channel_mlp, channel_mlp_skip, fno_skip, complex_data):
+def test_fno_advanced_params(
+    norm, use_channel_mlp, channel_mlp_skip, fno_skip, complex_data
+):
     """Test FNO with various advanced parameter combinations."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     s = 12
@@ -254,7 +258,9 @@ def test_fno_embedding_and_padding(positional_embedding, domain_padding):
 @pytest.mark.parametrize("channel_mlp_dropout", [0.0, 0.1, 0.5])
 @pytest.mark.parametrize("channel_mlp_expansion", [0.25, 0.5, 1.0])
 @pytest.mark.parametrize("non_linearity", [F.gelu, F.relu, F.tanh])
-def test_fno_channel_mlp_params(channel_mlp_dropout, channel_mlp_expansion, non_linearity):
+def test_fno_channel_mlp_params(
+    channel_mlp_dropout, channel_mlp_expansion, non_linearity
+):
     """Test FNO with different channel MLP parameters."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     s = 12
@@ -284,6 +290,58 @@ def test_fno_channel_mlp_params(channel_mlp_dropout, channel_mlp_expansion, non_
 
     # Check output size
     assert list(out.shape) == [batch_size, 1, *size]
+
+
+@pytest.mark.parametrize("norm", ["ada_in", "batch_ada_in"])
+@pytest.mark.parametrize("ada_in_pos_embed_type", [None, "transformer", "nerf"])
+def test_fno_ada_in(norm, ada_in_pos_embed_type):
+    """Test FNO with adaptive instance norm, with and without a positional embedding.
+
+    "ada_in" uses a single global embedding shared by every sample in the batch;
+    "batch_ada_in" uses one embedding per sample.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    s = 12
+    modes = 5
+    hidden_channels = 9
+    batch_size = 3
+    n_layers = 2
+    n_dim = 2
+    size = (s,) * n_dim
+    n_modes = (modes,) * n_dim
+    ada_in_dim = 1
+
+    model = FNO(
+        in_channels=3,
+        out_channels=1,
+        n_modes=n_modes,
+        hidden_channels=hidden_channels,
+        n_layers=n_layers,
+        norm=norm,
+        ada_in_dim=ada_in_dim,
+        ada_in_pos_embed_type=ada_in_pos_embed_type,
+        ada_embed_frequencies=4,
+    ).to(device)
+
+    in_data = torch.randn(batch_size, 3, *size).to(device)
+    if norm == "ada_in":
+        ada_in = torch.randn(ada_in_dim).to(device)
+    else:
+        ada_in = torch.randn(batch_size, ada_in_dim).to(device)
+
+    # Test forward pass
+    out = model(in_data, ada_in=ada_in)
+
+    # Check output size
+    assert list(out.shape) == [batch_size, 1, *size]
+
+    # Check backward pass
+    out.sum().backward()
+    n_unused_params = 0
+    for param in model.parameters():
+        if param.grad is None:
+            n_unused_params += 1
+    assert n_unused_params == 0, f"{n_unused_params} parameters were unused!"
 
 
 def test_fno_conv_bias_kernel():

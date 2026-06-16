@@ -36,9 +36,7 @@ class AdaIN(nn.Module):
 
         if mlp is None:
             mlp = nn.Sequential(
-                nn.Linear(embed_dim, 512),
-                nn.GELU(),
-                nn.Linear(512, 2*in_channels)
+                nn.Linear(embed_dim, 512), nn.GELU(), nn.Linear(512, 2 * in_channels)
             )
         self.mlp = mlp
 
@@ -46,15 +44,89 @@ class AdaIN(nn.Module):
 
     def set_embedding(self, x):
         """Set the embedding vector for style conditioning."""
-        self.embedding = x.reshape(self.embed_dim,)
+        self.embedding = x.reshape(
+            self.embed_dim,
+        )
 
     def forward(self, x):
         """Apply adaptive instance normalization to the input tensor."""
-        assert self.embedding is not None, "AdaIN: update embeddding before running forward"
+        assert (
+            self.embedding is not None
+        ), "AdaIN: update embeddding before running forward"
 
         weight, bias = torch.split(self.mlp(self.embedding), self.in_channels, dim=0)
 
         return nn.functional.group_norm(x, self.in_channels, weight, bias, eps=self.eps)
+
+
+class BatchAdaIN(nn.Module):
+    """Per-sample Adaptive Instance Normalization for neural operators.
+
+    Like AdaIN, BatchAdaIN performs instance normalization followed by adaptive
+    scaling and shifting derived from an embedding through an MLP. Unlike AdaIN,
+    which applies a single embedding's scale/shift to every sample in the batch,
+    BatchAdaIN accepts one embedding per sample and computes each sample's own
+    scale/shift independently. This is appropriate when the conditioning signal
+    (e.g. a physical parameter) varies across samples in the same batch.
+
+    Parameters
+    ----------
+    embed_dim : int
+        Dimension of the embedding vector used for conditioning
+    in_channels : int
+        Number of input channels to normalize
+    mlp : nn.Module, optional
+        Multi-layer perceptron that maps embeddings to (weight, bias) parameters.
+        Should output 2*in_channels values per sample. If None, a default MLP is
+        created with architecture: Linear(embed_dim, 512) -> GELU -> Linear(512, 2*in_channels)
+    eps : float, optional
+        Small value added to the denominator for numerical stability in normalization.
+        Default is 1e-5.
+    """
+
+    def __init__(self, embed_dim, in_channels, mlp=None, eps=1e-5):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.eps = eps
+
+        if mlp is None:
+            mlp = nn.Sequential(
+                nn.Linear(embed_dim, 512), nn.GELU(), nn.Linear(512, 2 * in_channels)
+            )
+        self.mlp = mlp
+
+        self.embedding = None
+
+    def set_embedding(self, x):
+        """Set the per-sample embeddings used for conditioning.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Batch of embeddings of shape (batch, embed_dim), one per sample.
+        """
+        assert x.ndim == 2, (
+            "BatchAdaIN: expected embeddings of shape (batch, embed_dim), "
+            f"got shape {tuple(x.shape)}"
+        )
+        self.embedding = x.reshape(x.shape[0], self.embed_dim)
+
+    def forward(self, x):
+        """Apply per-sample adaptive instance normalization to the input tensor."""
+        assert (
+            self.embedding is not None
+        ), "BatchAdaIN: update embeddding before running forward"
+        assert self.embedding.shape[0] == x.shape[0], (
+            f"BatchAdaIN: batch size of embeddings ({self.embedding.shape[0]}) "
+            f"must match batch size of input ({x.shape[0]})"
+        )
+
+        weight, bias = torch.split(self.mlp(self.embedding), self.in_channels, dim=-1)
+
+        normalized = nn.functional.instance_norm(x, eps=self.eps)
+        broadcast_shape = (x.shape[0], self.in_channels) + (1,) * (x.ndim - 2)
+        return normalized * weight.view(broadcast_shape) + bias.view(broadcast_shape)
 
 
 class InstanceNorm(nn.Module):
