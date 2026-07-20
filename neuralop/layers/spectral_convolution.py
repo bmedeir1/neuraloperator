@@ -414,13 +414,21 @@ class SpectralConv(BaseSpectralConv):
             n_modes[-1] = n_modes[-1] // 2 + 1
         self._n_modes = n_modes
 
-    def forward(self, x: torch.Tensor, output_shape: Optional[Tuple[int]] = None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        output_shape: Optional[Tuple[int]] = None,
+        override_weight: Optional[torch.Tensor] = None,
+    ):
         """Generic forward pass for the Factorized Spectral Conv
 
         Parameters
         ----------
         x : torch.Tensor
             input activation of size (batch_size, channels, d1, ..., dN)
+        override_weight : torch.Tensor, optional
+            If provided, used in place of ``self.weight`` for the spectral
+            contraction. Must have the same shape as ``self.weight``.
 
         Returns
         -------
@@ -486,7 +494,7 @@ class SpectralConv(BaseSpectralConv):
             slices_w += [slice(None, -starts[-1]) if starts[-1] else slice(None)]
 
         slices_w = tuple(slices_w)
-        weight = self.weight[slices_w]
+        weight = (override_weight if override_weight is not None else self.weight)[slices_w]
 
         ### Pick the first n_modes modes of FFT signal along each dim
 
@@ -566,5 +574,106 @@ class SpectralConv(BaseSpectralConv):
 
         if self.bias is not None:
             x = x + self.bias
-          
+
         return x
+
+
+class LoRASpectralConv(nn.Module):
+    """LoRA-style wrapper for SpectralConv with low-rank mode-space adaptation.
+
+    Wraps an existing (pretrained) SpectralConv whose parameters are frozen, and
+    introduces a single trainable complex matrix V of shape ``(n_modes, rank)``.
+    The adapted weight is:
+
+        W_new = (V @ Vᵀ) ⊗ (V_rfft @ V_rfft ᵀ) applied to W_0
+
+    computed as two sequential einsums for efficiency:
+
+        W_temp[i,j,k,y] = Σ_x  (V @ Vᵀ)[k,x]       * W_0[i,j,x,y]
+        W_new [i,j,k,l] = Σ_y  (V_rfft @ V_rfftᵀ)[l,y] * W_temp[i,j,k,y]
+
+    where ``V_rfft = V[:n_modes_rfft, :]`` is the slice of V used for the
+    y-mode dimension (automatically accounts for rfft halving). The same V is
+    shared across all channels and both mode dimensions, enforcing isotropy.
+
+    Parameters
+    ----------
+    spectral_conv : SpectralConv
+        Pretrained SpectralConv to adapt. Its parameters are frozen on wrapping.
+    rank : int
+        Rank of the LoRA adaptation matrix V.
+    """
+
+    def __init__(self, spectral_conv: SpectralConv, rank: int):
+        super().__init__()
+        self.spectral_conv = spectral_conv
+        for p in spectral_conv.parameters():
+            p.requires_grad_(False)
+
+        # TODO add check to ensure that number of modes is uniform in all directions  
+        n_modes = spectral_conv.max_n_modes[0]
+        self.rank = rank
+        init_std = (2 / (n_modes + rank)) ** 0.5
+        self.V = nn.Parameter(
+            torch.randn(n_modes, rank, dtype=torch.cfloat) * init_std
+        )
+
+    def _adapted_weight(self) -> torch.Tensor:
+        W0 = self.spectral_conv.weight
+        if not torch.is_tensor(W0):
+            W0 = W0.to_tensor()
+
+        n_modes_y = W0.shape[-1]  # already rfft-adjusted when complex_data=False
+        V_y = self.V[:n_modes_y, :]
+
+        V_adapt_x = self.V @ self.V.transpose(-1, -2)    # (n_modes_x, n_modes_x)
+        V_adapt_y = V_y @ V_y.transpose(-1, -2)          # (n_modes_y, n_modes_y)
+
+        # Apply sequentially: O(in_ch * out_ch * n_modes³) vs O(n_modes⁴) for a fused einsum
+        W_temp = torch.einsum("kx,ijxy->ijky", V_adapt_x, W0)
+        return torch.einsum("ly,ijky->ijkl", V_adapt_y, W_temp)
+
+    def forward(self, x: torch.Tensor, output_shape=None):
+        return self.spectral_conv.forward(
+            x, output_shape=output_shape, override_weight=self._adapted_weight()
+        )
+
+    def transform(self, x: torch.Tensor, output_shape=None):
+        return self.spectral_conv.transform(x, output_shape=output_shape)
+
+    @property
+    def n_modes(self):
+        return self.spectral_conv.n_modes
+
+    @n_modes.setter
+    def n_modes(self, n_modes):
+        self.spectral_conv.n_modes = n_modes
+
+
+def inject_lora_spectral_conv(model: nn.Module, rank: int) -> nn.Module:
+    """Replace all SpectralConv layers in a model with LoRASpectralConv wrappers.
+
+    Recursively walks the module tree and replaces each SpectralConv in-place
+    with a LoRASpectralConv of the given rank. The wrapped SpectralConv
+    parameters are frozen; only the LoRA matrix V remains trainable.
+
+    Works with nested modules including ``nn.ModuleList``.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Model whose SpectralConv layers should be adapted.
+    rank : int
+        Rank of the LoRA adaptation.
+
+    Returns
+    -------
+    nn.Module
+        The same model object with SpectralConv layers replaced in-place.
+    """
+    for name, module in model.named_children():
+        if isinstance(module, SpectralConv):
+            setattr(model, name, LoRASpectralConv(module, rank))
+        else:
+            inject_lora_spectral_conv(module, rank)
+    return model
