@@ -640,6 +640,24 @@ class LoRASpectralConv(nn.Module):
 
     def transform(self, x: torch.Tensor, output_shape=None):
         return self.spectral_conv.transform(x, output_shape=output_shape)
+    
+    def compose_n_times(self, n: int): 
+        W0 = self.spectral_conv.weight
+        if not torch.is_tensor(W0):
+            W0 = W0.to_tensor()
+
+        n_modes_y = W0.shape[-1]  # already rfft-adjusted when complex_data=False
+        V_y = self.V[:n_modes_y, :]
+
+        V_adapt_x = self.V @ self.V.transpose(-1, -2)    # (n_modes_x, n_modes_x)
+        V_adapt_y = V_y @ V_y.transpose(-1, -2)          # (n_modes_y, n_modes_y)
+
+        for _ in range(n - 1):
+            V_adapt_x = V_adapt_x @ V_adapt_x
+            V_adapt_y = V_adapt_y @ V_adapt_y
+        
+        W_temp = torch.einsum("kx,ijxy->ijky", V_adapt_x, W0)
+        self.spectral_conv.weight = torch.einsum("ly,ijky->ijkl", V_adapt_y, W_temp)
 
     @property
     def n_modes(self):
@@ -676,4 +694,33 @@ def inject_lora_spectral_conv(model: nn.Module, rank: int) -> nn.Module:
             setattr(model, name, LoRASpectralConv(module, rank))
         else:
             inject_lora_spectral_conv(module, rank)
+    return model
+    
+def compose_all_adapted_layers_n_times(model: nn.Module, n: int) -> nn.Module:
+    """Compose all LoRASpectralConv layers in a model n times.
+
+    Recursively walks the module tree and calls compose_n_times(n) on each
+    LoRASpectralConv layer in-place. This effectively updates the underlying
+    SpectralConv weights to reflect n sequential applications of the LoRA
+    adaptation.
+
+    Works with nested modules including ``nn.ModuleList``.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Model whose LoRASpectralConv layers should be composed.
+    n : int
+        Number of times to compose each adapted layer.
+
+    Returns
+    -------
+    nn.Module
+        The same model object with LoRASpectralConv layers composed in-place.
+    """
+    for _, module in model.named_children():
+        if isinstance(module, LoRASpectralConv):
+            module.compose_n_times(n)
+        else:
+            compose_all_adapted_layers_n_times(module, n)
     return model
