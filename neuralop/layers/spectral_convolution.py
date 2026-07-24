@@ -617,6 +617,16 @@ class LoRASpectralConv(nn.Module):
         self.V = nn.Parameter(
             torch.randn(n_modes, rank, dtype=torch.cfloat) * init_std
         )
+        self.V_adapt_x = None
+        self.V_adapt_y = None
+    
+    def _get_adapted_x_y(self, n_modes_y) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.eval() and self.V_adapt_x is not None and self.V_adapt_y is not None:
+            return self.V_adapt_x, self.V_adapt_y
+        V_y = self.V[:n_modes_y, :]
+        V_adapt_x = self.V @ self.V.transpose(-1, -2)    # (n_modes_x, n_modes_x)
+        V_adapt_y = V_y @ V_y.transpose(-1, -2)          # (n_modes_y, n_modes_y)
+        return V_adapt_x, V_adapt_y
 
     def _adapted_weight(self) -> torch.Tensor:
         W0 = self.spectral_conv.weight
@@ -624,10 +634,8 @@ class LoRASpectralConv(nn.Module):
             W0 = W0.to_tensor()
 
         n_modes_y = W0.shape[-1]  # already rfft-adjusted when complex_data=False
-        V_y = self.V[:n_modes_y, :]
 
-        V_adapt_x = self.V @ self.V.transpose(-1, -2)    # (n_modes_x, n_modes_x)
-        V_adapt_y = V_y @ V_y.transpose(-1, -2)          # (n_modes_y, n_modes_y)
+        V_adapt_x, V_adapt_y = self._get_adapted_x_y(n_modes_y)
 
         # Apply sequentially: O(in_ch * out_ch * n_modes³) vs O(n_modes⁴) for a fused einsum
         W_temp = torch.einsum("kx,ijxy->ijky", V_adapt_x, W0)
@@ -641,7 +649,14 @@ class LoRASpectralConv(nn.Module):
     def transform(self, x: torch.Tensor, output_shape=None):
         return self.spectral_conv.transform(x, output_shape=output_shape)
     
-    def compose_n_times(self, n: int): 
+    def compose_n_times(self, n: int):
+        """
+        Take the base LoRA weights and update them in-place by composing them n times such that the weights 
+        represent the adaptation to an n'th composition of the operator.
+        
+        Note that we always start from the base LoRA weights, so this is not a cumulative operation.
+        However, you can apply the composition and use for any amount of inference without retraining.
+        """
         W0 = self.spectral_conv.weight
         if not torch.is_tensor(W0):
             W0 = W0.to_tensor()
@@ -656,8 +671,8 @@ class LoRASpectralConv(nn.Module):
             V_adapt_x = V_adapt_x @ V_adapt_x
             V_adapt_y = V_adapt_y @ V_adapt_y
         
-        W_temp = torch.einsum("kx,ijxy->ijky", V_adapt_x, W0)
-        self.spectral_conv.weight = torch.einsum("ly,ijky->ijkl", V_adapt_y, W_temp)
+        self.V_adapt_x = V_adapt_x
+        self.V_adapt_y = V_adapt_y
 
     @property
     def n_modes(self):
