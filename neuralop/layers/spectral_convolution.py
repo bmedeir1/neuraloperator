@@ -673,6 +673,7 @@ class LoRASpectralConv(nn.Module):
         
         self.V_adapt_x = V_adapt_x
         self.V_adapt_y = V_adapt_y
+        print(f"Composed LoRA weights {n} times. V_adapt_x mean: {V_adapt_x.mean()}, V_adapt_y mean: {V_adapt_y.mean()}")
 
     @property
     def n_modes(self):
