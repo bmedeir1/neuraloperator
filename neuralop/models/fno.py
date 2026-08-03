@@ -383,7 +383,7 @@ class FNO(BaseModel, name="FNO"):
         if self.complex_data:
             self.projection = ComplexValued(self.projection)
 
-    def forward(self, x, output_shape=None, ada_in=None, **kwargs):
+    def forward(self, x, output_shape=None, ada_in=None, coarsening_level=0, **kwargs):
         """FNO's forward pass
 
         1. Applies optional positional encoding
@@ -447,7 +447,7 @@ class FNO(BaseModel, name="FNO"):
             self.fno_blocks.set_ada_in_embeddings(ada_in_embed)
 
         for layer_idx in range(self.n_layers):
-            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
+            x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx], coarsening_level=coarsening_level)
 
         if self.domain_padding is not None:
             x = self.domain_padding.unpad(x)

@@ -360,6 +360,10 @@ class FNOBlocks(nn.Module):
         if self.complex_data and self.norm is not None:
             self.norm = nn.ModuleList([ComplexValued(x) for x in self.norm])
 
+        # Temporary flag to indicate whether the conv_module supports coarsening.
+        # This can be removed once all conv_modules support coarsening_level as a parameter in forward.
+        self.coarsening_enabled = conv_module is SpectralConv
+
     def set_ada_in_embeddings(self, *embeddings):
         """Sets the embeddings of each Ada-IN norm layers
 
@@ -377,13 +381,13 @@ class FNOBlocks(nn.Module):
                 for norm, embedding in zip(self.norm, embeddings):
                     norm.set_embedding(embedding)
 
-    def forward(self, x, index=0, output_shape=None):
+    def forward(self, x, index=0, output_shape=None, coarsening_level=0):
         if self.preactivation:
-            return self.forward_with_preactivation(x, index, output_shape)
+            return self.forward_with_preactivation(x, index, output_shape, coarsening_level=coarsening_level)
         else:
-            return self.forward_with_postactivation(x, index, output_shape)
+            return self.forward_with_postactivation(x, index, output_shape, coarsening_level=coarsening_level)
 
-    def forward_with_postactivation(self, x, index=0, output_shape=None):
+    def forward_with_postactivation(self, x, index=0, output_shape=None, coarsening_level=0):
         if self.fno_skips is not None:
             x_skip_fno = self.fno_skips[index](x)
             x_skip_fno = self.convs[index].transform(
@@ -402,7 +406,10 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        if self.coarsening_enabled:
+            x_fno = self.convs[index](x, output_shape=output_shape, coarsening_level=coarsening_level)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         if self.norm is not None:
             x_fno = self.norm[self.n_norms * index](x_fno)
@@ -426,7 +433,7 @@ class FNOBlocks(nn.Module):
 
         return x
 
-    def forward_with_preactivation(self, x, index=0, output_shape=None):
+    def forward_with_preactivation(self, x, index=0, output_shape=None, coarsening_level=0):
         # Apply non-linear activation (and norm)
         # before this block's convolution/forward pass:
         x = self.non_linearity(x)
@@ -452,7 +459,10 @@ class FNOBlocks(nn.Module):
             else:
                 x = torch.tanh(x)
 
-        x_fno = self.convs[index](x, output_shape=output_shape)
+        if self.coarsening_enabled:
+            x_fno = self.convs[index](x, output_shape=output_shape, coarsening_level=coarsening_level)
+        else:
+            x_fno = self.convs[index](x, output_shape=output_shape)
 
         x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
 
