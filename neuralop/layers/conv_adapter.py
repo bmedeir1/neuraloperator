@@ -16,9 +16,9 @@ class MLPAdaptableSpectralConv(BaseSpectralConv):
     Once trained, network weights can be precomputed for any desired coarsening level.
     """
 
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.spectral_conv = SpectralConv(**kwargs)
+    def __init__(self, *args, **kwargs):
+        super().__init__(device=kwargs.get("device"))
+        self.spectral_conv = SpectralConv(*args, **kwargs)
         total_modes = math.prod(self.spectral_conv.max_n_modes)
         hidden_dim = 2 * total_modes
         self.mlp = nn.Sequential(
