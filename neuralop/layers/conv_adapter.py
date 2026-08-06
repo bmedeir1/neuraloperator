@@ -91,3 +91,32 @@ class MLPAdaptableSpectralConv(BaseSpectralConv):
             separable=self.spectral_conv.separable,
         )
         self.base_coarsening_level += coarsening_level
+
+
+def coarsen_model(model: nn.Module, coarsening_level: int) -> nn.Module:
+    """Merge MLP-adapted weights into SpectralConv weights in a model to coarsen it.
+
+    Recursively walks the module tree and calls merge_mlp_weights(coarsening_level) on each
+    MLPAdaptableSpectralConv layer in-place. This effectively updates the underlying
+    SpectralConv weights to reflect the coarsened representation.
+
+    Works with nested modules including ``nn.ModuleList``.
+
+    Parameters
+    ----------
+    model : nn.Module
+        Model whose MLPAdaptableSpectralConv layers should be merged into SpectralConv.
+    coarsening_level : int
+        Number of levels of coarsening to apply to each MLPAdaptableSpectralConv-wrapped SpectralConv layer.
+
+    Returns
+    -------
+    nn.Module
+        The same model object with coarsened SpectralConv weights.
+    """
+    for _, module in model.named_children():
+        if isinstance(module, MLPAdaptableSpectralConv):
+            module.merge_mlp_weights(coarsening_level)
+        else:
+            coarsen_model(module, coarsening_level)
+    return model
