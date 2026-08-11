@@ -4,7 +4,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from neuralop.layers.conv_adapter import MLPAdaptableSpectralConv
+from neuralop.layers.conv_adapter import AdaptableSpectralConv
 
 from .channel_mlp import ChannelMLP
 from .complex import CGELU, ctanh, ComplexValued
@@ -364,7 +364,7 @@ class FNOBlocks(nn.Module):
 
         # Temporary flag to indicate whether the conv_module supports coarsening.
         # This can be removed once all conv_modules support coarsening_level as a parameter in forward.
-        self.coarsening_enabled = conv_module is MLPAdaptableSpectralConv
+        self.coarsening_enabled = issubclass(conv_module, AdaptableSpectralConv)
 
     def set_ada_in_embeddings(self, *embeddings):
         """Sets the embeddings of each Ada-IN norm layers
