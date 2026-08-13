@@ -38,6 +38,8 @@ class AdaptableSpectralConv(BaseSpectralConv):
 
         Operates on real-valued tensors, so real and imaginary parts
         of the complex weight are adapted independently with shared parameters.
+
+        Residual block formulation to match LoRA style adaptation, where the original weight is added to the transformed weight.
         """
         for _ in range(coarsening_level):
             W_real = self.weight_transform(W_flat.real) + W_flat.real
@@ -92,7 +94,7 @@ def coarsen_model(model: nn.Module, coarsening_level: int) -> nn.Module:
     """Merge MLP-adapted weights into SpectralConv weights in a model to coarsen it.
 
     Recursively walks the module tree and calls merge_mlp_weights(coarsening_level) on each
-    MLPAdaptableSpectralConv layer in-place. This effectively updates the underlying
+    AdaptableSpectralConv layer in-place. This effectively updates the underlying
     SpectralConv weights to reflect the coarsened representation.
 
     Works with nested modules including ``nn.ModuleList``.
@@ -158,5 +160,8 @@ class GLUAdaptableSpectralConv(AdaptableSpectralConv):
         super().__init__(*args, **kwargs)
         self.weight_transform = nn.Sequential(
             SwiGLU(self.total_modes, self.hidden_dim),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+            SwiGLU(self.hidden_dim, self.hidden_dim),
             nn.Linear(self.hidden_dim, self.total_modes),
         )
