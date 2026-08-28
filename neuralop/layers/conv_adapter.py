@@ -159,8 +159,7 @@ class GLUAdaptableSpectralConv(AdaptableSpectralConv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.weight_transform = nn.Sequential(
-            SwiGLU(self.total_modes, self.hidden_dim),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.Linear(self.total_modes, self.hidden_dim),
             nn.GELU(),
             SwiGLU(self.hidden_dim, self.hidden_dim),
             nn.Linear(self.hidden_dim, self.total_modes),
