@@ -11,13 +11,20 @@ class AdaptableSpectralConv(BaseSpectralConv):
     This is useful for multi-grid FNOs where the same operator is applied at different resolutions.
     
     Once trained, network weights can be precomputed for any desired coarsening level.
+
+    Parameters
+    ----------
+    hidden_scale : int, optional
+        Expansion factor of the weight transform's hidden dimension relative to its input
+        dimension, by default 2. All other arguments are passed to SpectralConv.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, hidden_scale: int = 2, **kwargs):
         super().__init__(device=kwargs.get("device"))
         self.spectral_conv = SpectralConv(*args, **kwargs)
         self.total_modes = math.prod(self.spectral_conv.max_n_modes)
-        self.hidden_dim = 2 * self.total_modes
+        self.hidden_scale = hidden_scale
+        self.hidden_dim = hidden_scale * self.total_modes
         self.weight_transform = self.default_weight_transform
         self.base_coarsening_level = 0
 
@@ -163,4 +170,75 @@ class GLUAdaptableSpectralConv(AdaptableSpectralConv):
             nn.GELU(),
             SwiGLU(self.hidden_dim, self.hidden_dim),
             nn.Linear(self.hidden_dim, self.total_modes),
+        )
+
+
+class FactorizedChannelAdaptableSpectralConv(AdaptableSpectralConv):
+    """Base class for adapters that mix only along the channel dimensions of the Fourier weights,
+    factorized into one transform per channel axis.
+
+    For a dense weight of shape (in, out, *modes), the update is applied sequentially:
+    first along the input-channel axis (shared across output channels and modes), then along
+    the output-channel axis (shared across input channels and modes), each with a skip connection.
+    For a separable weight of shape (channels, *modes), there is a single channel axis,
+    so only the input-channel transform is used.
+
+    Compared to transforming the flattened (in * out) channel matrix at each mode jointly,
+    this reduces the parameter count from O((in * out)^2) to O(in^2 + out^2).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sc = self.spectral_conv
+        self.in_transform = self._make_transform(sc.in_channels)
+        self.out_transform = None if sc.separable else self._make_transform(sc.out_channels)
+        self.weight_transform = self.factorized_weight_transform
+
+    def _make_transform(self, n_channels: int) -> nn.Module:
+        raise NotImplementedError("Subclasses must define the per-axis channel transform.")
+
+    def factorized_weight_transform(self, W_flat: torch.Tensor) -> torch.Tensor:
+        """Return the total update to W_flat; the outer skip connection adds W_flat back."""
+        if self.spectral_conv.separable:
+            # (channels, modes) -> (modes, channels)
+            return self.in_transform(W_flat.transpose(0, 1)).transpose(0, 1)
+
+        # (in, out, modes) -> (out, modes, in): mix along input channels
+        dW_in = self.in_transform(W_flat.permute(1, 2, 0)).permute(2, 0, 1)
+        W_mid = W_flat + dW_in
+        # (in, out, modes) -> (in, modes, out): mix along output channels
+        dW_out = self.out_transform(W_mid.permute(0, 2, 1)).permute(0, 2, 1)
+        return dW_in + dW_out
+
+
+class MLPFactorizedChannelAdaptableSpectralConv(FactorizedChannelAdaptableSpectralConv):
+    """Factorized channel adapter where each per-axis transform is an MLP.
+    The MLPs are applied independently to the real and imaginary parts of the complex weights.
+
+    Once trained, network weights can be precomputed for any desired coarsening level.
+    """
+
+    def _make_transform(self, n_channels: int) -> nn.Module:
+        hidden_dim = self.hidden_scale * n_channels
+        return nn.Sequential(
+            nn.Linear(n_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_channels),
+        )
+
+
+class GLUFactorizedChannelAdaptableSpectralConv(FactorizedChannelAdaptableSpectralConv):
+    """Factorized channel adapter where each per-axis transform is a Gated Linear Unit (GLU)-based network.
+    The GLUs are applied independently to the real and imaginary parts of the complex weights.
+
+    Once trained, network weights can be precomputed for any desired coarsening level.
+    """
+
+    def _make_transform(self, n_channels: int) -> nn.Module:
+        hidden_dim = self.hidden_scale * n_channels
+        return nn.Sequential(
+            nn.Linear(n_channels, hidden_dim),
+            nn.GELU(),
+            SwiGLU(hidden_dim, hidden_dim),
+            nn.Linear(hidden_dim, n_channels),
         )
