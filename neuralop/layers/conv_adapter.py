@@ -2,6 +2,7 @@ import math
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from neuralop.layers.base_spectral_conv import BaseSpectralConv
 from neuralop.layers.spectral_convolution import SpectralConv, get_contract_fun
@@ -16,15 +17,24 @@ class AdaptableSpectralConv(BaseSpectralConv):
     ----------
     hidden_scale : int, optional
         Expansion factor of the weight transform's hidden dimension relative to its input
-        dimension, by default 2. All other arguments are passed to SpectralConv.
+        dimension, by default 2.
+    checkpoint_weight_transform : bool, optional
+        Whether to gradient-checkpoint each application of the weight transform during training,
+        by default False. Only one application's activations are kept in memory and the rest are
+        recomputed in the backward pass, so peak memory no longer grows with the coarsening level,
+        at the cost of extra compute. Gradients are exact. Can be toggled after construction
+        by setting the attribute of the same name.
+
+    All other arguments are passed to SpectralConv.
     """
 
-    def __init__(self, *args, hidden_scale: int = 2, **kwargs):
+    def __init__(self, *args, hidden_scale: int = 2, checkpoint_weight_transform: bool = False, **kwargs):
         super().__init__(device=kwargs.get("device"))
         self.spectral_conv = SpectralConv(*args, **kwargs)
         self.total_modes = math.prod(self.spectral_conv.max_n_modes)
         self.hidden_scale = hidden_scale
         self.hidden_dim = hidden_scale * self.total_modes
+        self.checkpoint_weight_transform = checkpoint_weight_transform
         self.weight_transform = self.default_weight_transform
         self.base_coarsening_level = 0
 
@@ -47,12 +57,27 @@ class AdaptableSpectralConv(BaseSpectralConv):
         of the complex weight are adapted independently with shared parameters.
 
         Residual block formulation to match LoRA style adaptation, where the original weight is added to the transformed weight.
+
+        If `checkpoint_weight_transform` is set and gradients are enabled, each application is
+        gradient-checkpointed.
         """
+        def one_application(W_real, W_imag):
+            return (self.weight_transform(W_real) + W_real,
+                    self.weight_transform(W_imag) + W_imag)
+
+        # Real and imaginary parts stay unpacked across applications, so each
+        # checkpointed segment covers one full application.
+        W_real, W_imag = W_flat.real, W_flat.imag
+        use_checkpoint = self.checkpoint_weight_transform and torch.is_grad_enabled()
         for _ in range(coarsening_level):
-            W_real = self.weight_transform(W_flat.real) + W_flat.real
-            W_imag = self.weight_transform(W_flat.imag) + W_flat.imag
-            W_flat = torch.complex(W_real, W_imag)
-        return W_flat
+            if use_checkpoint:
+                # use_reentrant=False is required: if the base weights are frozen, the inputs to the
+                # first application don't require grad, and the reentrant implementation would
+                # silently return an output with no grad_fn.
+                W_real, W_imag = checkpoint(one_application, W_real, W_imag, use_reentrant=False)
+            else:
+                W_real, W_imag = one_application(W_real, W_imag)
+        return torch.complex(W_real, W_imag)
     
     def forward(self, x: torch.Tensor, coarsening_level: int = 0, output_shape=None):
         if coarsening_level == 0:
