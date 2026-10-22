@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import torch
 from torch import nn
@@ -18,19 +19,22 @@ class LoRAFNOBlocks(nn.Module):
     one application corresponds to one level of coarsening, matching AdaptableSpectralConv.
     At ``coarsening_level=0`` the wrapped FNOBlocks is used unchanged.
 
-    B is initialized to zero so that the adapted model initially matches the wrapped one.
+    If ``rank`` is None, each layer instead has a single full-rank matrix W (channels, channels)
+    and the update is y <- y + W y.
+
+    B (or W) is initialized to zero so that the adapted model initially matches the wrapped one.
 
     Parameters
     ----------
     fno_blocks : FNOBlocks
         FNOBlocks module to adapt.
-    rank : int
-        Rank of the low-rank update.
+    rank : int or None, optional
+        Rank of the low-rank update, by default None (full-rank update).
     freeze_base : bool, optional
         Whether to freeze the parameters of the wrapped FNOBlocks, by default True.
     """
 
-    def __init__(self, fno_blocks: FNOBlocks, rank: int, freeze_base: bool = True):
+    def __init__(self, fno_blocks: FNOBlocks, rank: Optional[int] = None, freeze_base: bool = True):
         super().__init__()
         if fno_blocks.complex_data:
             raise NotImplementedError("LoRAFNOBlocks does not support complex_data yet.")
@@ -44,6 +48,12 @@ class LoRAFNOBlocks(nn.Module):
         channels = fno_blocks.out_channels
         n_layers = fno_blocks.n_layers
         device = next(fno_blocks.parameters()).device
+        if rank is None:
+            self.lora_W = nn.ParameterList(
+                [nn.Parameter(torch.zeros(channels, channels, device=device)) for _ in range(n_layers)]
+            )
+            return
+
         self.lora_A = nn.ParameterList(
             [nn.Parameter(torch.empty(rank, channels, device=device)) for _ in range(n_layers)]
         )
@@ -54,7 +64,9 @@ class LoRAFNOBlocks(nn.Module):
             nn.init.kaiming_uniform_(A, a=math.sqrt(5))
 
     def _lora_update(self, y: torch.Tensor, index: int) -> torch.Tensor:
-        """Compute B A y pointwise along the channel dimension of y of shape (batch, channels, *spatial)."""
+        """Compute B A y (or W y if full-rank) pointwise along the channel dimension of y of shape (batch, channels, *spatial)."""
+        if self.rank is None:
+            return torch.einsum("dc,bc...->bd...", self.lora_W[index], y)
         Ay = torch.einsum("rc,bc...->br...", self.lora_A[index], y)
         return torch.einsum("cr,br...->bc...", self.lora_B[index], Ay)
 
@@ -80,7 +92,7 @@ class LoRAFNOBlocks(nn.Module):
         self.fno_blocks.set_ada_in_embeddings(*embeddings)
 
 
-def inject_lora_fno_blocks(model: nn.Module, rank: int, freeze_base: bool = True) -> nn.Module:
+def inject_lora_fno_blocks(model: nn.Module, rank: Optional[int] = None, freeze_base: bool = True) -> nn.Module:
     """Replace all FNOBlocks in a model with LoRAFNOBlocks wrappers.
 
     Recursively walks the module tree and replaces each FNOBlocks in-place with a
@@ -92,8 +104,8 @@ def inject_lora_fno_blocks(model: nn.Module, rank: int, freeze_base: bool = True
     ----------
     model : nn.Module
         Model whose FNOBlocks should be adapted.
-    rank : int
-        Rank of the low-rank update.
+    rank : int or None, optional
+        Rank of the low-rank update, by default None (full-rank update).
     freeze_base : bool, optional
         Whether to freeze the parameters of the wrapped FNOBlocks, by default True.
 
