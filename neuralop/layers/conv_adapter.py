@@ -267,3 +267,113 @@ class GLUFactorizedChannelAdaptableSpectralConv(FactorizedChannelAdaptableSpectr
             SwiGLU(hidden_dim, hidden_dim),
             nn.Linear(hidden_dim, n_channels),
         )
+
+
+class LoRAAdaptableSpectralConv(AdaptableSpectralConv):
+    """Base class for LoRA-style adapters that add a low-rank update to the Fourier weights.
+
+    At each retained Fourier mode k, the weight W_k is an (in, out) channel-mixing matrix.
+    The adapter learns a complex update ΔW_k that is low-rank in the channel dimensions,
+    and coarsening level n uses
+
+        W = W_0 + n * ΔW
+
+    i.e. the additive update applied recursively n times. ΔW does not depend on W, so unlike
+    the other adapters the effect grows linearly with the coarsening level.
+    Subclasses define how ΔW is parametrized across modes.
+
+    The update is initialized to zero, so the adapted layer initially matches the wrapped one.
+    Only dense (non-separable) weights are supported.
+
+    Parameters
+    ----------
+    lora_rank : int, optional
+        Rank of the update in the channel dimensions, by default 8. Named ``lora_rank`` because
+        ``rank`` is the SpectralConv tensor-factorization rank.
+
+    All other arguments are passed to AdaptableSpectralConv.
+    """
+
+    def __init__(self, *args, lora_rank: int = 8, **kwargs):
+        super().__init__(*args, **kwargs)
+        sc = self.spectral_conv
+        if sc.separable:
+            raise NotImplementedError("LoRA adapters require dense (non-separable) spectral weights.")
+        self.lora_rank = lora_rank
+
+        W0 = sc.weight if torch.is_tensor(sc.weight) else sc.weight.to_tensor()
+        self._factory_kwargs = dict(dtype=W0.dtype, device=W0.device)
+        self._init_std = 1 / math.sqrt(sc.in_channels)
+
+    def delta_weight(self) -> torch.Tensor:
+        """Return ΔW of shape (in, out, total_modes)."""
+        raise NotImplementedError("Subclasses must define the low-rank weight update.")
+
+    def _apply_weight_transform(self, W_flat: torch.Tensor, coarsening_level: int) -> torch.Tensor:
+        return W_flat + coarsening_level * self.delta_weight()
+
+
+class PerModeLoRAAdaptableSpectralConv(LoRAAdaptableSpectralConv):
+    """LoRA adapter with an independent low-rank update at every Fourier mode:
+
+        ΔW_k = B_k A_k,    A_k: (rank, in),  B_k: (out, rank)
+
+    Most expressive of the LoRA adapters; nothing is shared between modes.
+    Parameters: rank * (in + out) * total_modes (complex).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sc, fk = self.spectral_conv, self._factory_kwargs
+        self.lora_A = nn.Parameter(
+            self._init_std * torch.randn(self.total_modes, self.lora_rank, sc.in_channels, **fk)
+        )
+        self.lora_B = nn.Parameter(
+            torch.zeros(self.total_modes, sc.out_channels, self.lora_rank, **fk)
+        )
+
+    def delta_weight(self) -> torch.Tensor:
+        return torch.einsum("kor,kri->iok", self.lora_B, self.lora_A)
+
+
+class CPLoRAAdaptableSpectralConv(LoRAAdaptableSpectralConv):
+    """LoRA adapter with channel factors shared across modes and a per-mode scale (CP decomposition):
+
+        ΔW_k = B diag(s_k) A,    A: (rank, in),  B: (out, rank),  s: (total_modes, rank)
+
+    Each rank-1 component is a channel coupling (read along a_r, write along b_r) with its own
+    learned spectral filter s_r. s is initialized to one, so training starts from a
+    mode-independent update.
+    Parameters: rank * (in + out + total_modes) (complex).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sc, fk = self.spectral_conv, self._factory_kwargs
+        self.lora_A = nn.Parameter(self._init_std * torch.randn(self.lora_rank, sc.in_channels, **fk))
+        self.lora_B = nn.Parameter(torch.zeros(sc.out_channels, self.lora_rank, **fk))
+        self.lora_s = nn.Parameter(torch.ones(self.total_modes, self.lora_rank, **fk))
+
+    def delta_weight(self) -> torch.Tensor:
+        return torch.einsum("or,kr,ri->iok", self.lora_B, self.lora_s, self.lora_A)
+
+
+class SharedLoRAAdaptableSpectralConv(LoRAAdaptableSpectralConv):
+    """LoRA adapter with a single low-rank update shared by every Fourier mode:
+
+        ΔW_k = B A,    A: (rank, in),  B: (out, rank)
+
+    Equivalent to adding a low-pass-filtered low-rank 1x1 convolution. Closest to LLM LoRA,
+    where one update is applied at every position.
+    Parameters: rank * (in + out) (complex).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        sc, fk = self.spectral_conv, self._factory_kwargs
+        self.lora_A = nn.Parameter(self._init_std * torch.randn(self.lora_rank, sc.in_channels, **fk))
+        self.lora_B = nn.Parameter(torch.zeros(sc.out_channels, self.lora_rank, **fk))
+
+    def delta_weight(self) -> torch.Tensor:
+        dW = torch.einsum("or,ri->io", self.lora_B, self.lora_A)
+        return dW.unsqueeze(-1).expand(-1, -1, self.total_modes)
