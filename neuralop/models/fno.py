@@ -222,7 +222,7 @@ class FNO(BaseModel, name="FNO"):
         ada_in_pos_embed_type: Union[str, None] = None,
         ada_in_embed_frequencies: Union[int, None] = 4,
         preactivation: bool = False,
-        conv_module: nn.Module = SpectralConv,
+        conv_module: type[nn.Module] = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
     ):
         if decomposition_kwargs is None:

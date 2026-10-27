@@ -229,7 +229,7 @@ class LocalNO(BaseModel, name="LocalNO"):
         decomposition_kwargs: dict = dict(),
         separable: bool = False,
         preactivation: bool = False,
-        conv_module: nn.Module = SpectralConv,
+        conv_module: type[nn.Module] = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
     ):
         super().__init__()

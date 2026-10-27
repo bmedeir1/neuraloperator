@@ -161,7 +161,7 @@ class FNOBlocks(nn.Module):
         separable=False,
         factorization=None,
         rank=1.0,
-        conv_module=SpectralConv,
+        conv_module: type[nn.Module] = SpectralConv,
         fixed_rank_modes=False,
         implementation="factorized",
         decomposition_kwargs=dict(),

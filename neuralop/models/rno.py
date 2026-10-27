@@ -200,7 +200,7 @@ class RNO(BaseModel, name="RNO"):
         decomposition_kwargs: dict = None,
         separable: bool = False,
         preactivation: bool = False,
-        conv_module: nn.Module = SpectralConv,
+        conv_module: type[nn.Module] = SpectralConv,
         enforce_hermitian_symmetry: bool = True,
     ):
         if decomposition_kwargs is None:
