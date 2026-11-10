@@ -128,6 +128,104 @@ class BatchAdaIN(nn.Module):
         broadcast_shape = (x.shape[0], self.in_channels) + (1,) * (x.ndim - 2)
         return normalized * weight.view(broadcast_shape) + bias.view(broadcast_shape)
 
+class AdaLNModulation(nn.Module):
+    """Per-sample conditioned modulation (adaLN-Zero) for neural operators.
+
+    Follows the adaLN-Zero conditioning of DiT [1]_: the input is normalized,
+    then modulated as ``norm(x) * (1 + scale) + shift``, and a per-channel
+    ``gate`` is returned alongside to scale the output of the residual branch
+    the modulated tensor is fed into. ``scale``, ``shift`` and ``gate`` are
+    produced per sample from a conditioning embedding by an MLP.
+
+    Unlike DiT, which uses LayerNorm over channels for each token, normalization
+    here is instance normalization (over the spatial dimensions, per sample and
+    channel), the natural analogue for function-space inputs.
+
+    When the default MLP is used, its last layer is zero-initialized, so that at
+    initialization ``scale = shift = gate = 0``: the modulation is the identity
+    on the normalized input and the gated branch contributes nothing.
+
+    Parameters
+    ----------
+    embed_dim : int
+        Dimension of the embedding vector used for conditioning
+    in_channels : int
+        Number of input channels to normalize
+    mlp : nn.Module, optional
+        Multi-layer perceptron that maps embeddings to scale, shift, and gate parameters.
+        Should output 3*in_channels values per sample. If None, a default MLP is
+        created with architecture: Linear(embed_dim, 512) -> GELU -> Linear(512, 3*in_channels),
+        with the last layer zero-initialized.
+    eps : float, optional
+        Small value added to the denominator for numerical stability in normalization.
+        Default is 1e-5.
+
+    References
+    ----------
+    .. [1] Peebles, W., Xie, S. "Scalable Diffusion Models with Transformers" (2023).
+           ICCV 2023, https://arxiv.org/abs/2212.09748.
+    """
+
+    def __init__(self, embed_dim, in_channels, mlp=None, eps=1e-5):
+        super().__init__()
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        self.eps = eps
+
+        if mlp is None:
+            mlp = nn.Sequential(
+                nn.Linear(embed_dim, 512), nn.GELU(), nn.Linear(512, 3 * in_channels)
+            )
+            # adaLN-Zero: start with scale = shift = gate = 0
+            nn.init.zeros_(mlp[-1].weight)
+            nn.init.zeros_(mlp[-1].bias)
+        self.mlp = mlp
+
+        self.embedding = None
+
+    def set_embedding(self, x):
+        """Set the per-sample embeddings used for conditioning.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Batch of embeddings of shape (batch, embed_dim), one per sample.
+        """
+        assert x.ndim == 2, (
+            "AdaLNModulation: expected embeddings of shape (batch, embed_dim), "
+            f"got shape {tuple(x.shape)}"
+        )
+        self.embedding = x.reshape(x.shape[0], self.embed_dim)
+
+    def forward(self, x):
+        """Normalize and modulate the input; also return the gate.
+
+        Returns
+        -------
+        modulated : torch.Tensor
+            ``instance_norm(x) * (1 + scale) + shift``, same shape as ``x``.
+        gate : torch.Tensor
+            Per-sample, per-channel gate of shape (batch, in_channels, 1, ..., 1),
+            to multiply the output of the residual branch.
+        """
+        assert (
+            self.embedding is not None
+        ), "AdaLNModulation: update embeddding before running forward"
+        assert self.embedding.shape[0] == x.shape[0], (
+            f"AdaLNModulation: batch size of embeddings ({self.embedding.shape[0]}) "
+            f"must match batch size of input ({x.shape[0]})"
+        )
+
+        scale, shift, gate = torch.split(
+            self.mlp(self.embedding), self.in_channels, dim=-1
+        )
+        normalized = nn.functional.instance_norm(x, eps=self.eps)
+        broadcast_shape = (x.shape[0], self.in_channels) + (1,) * (x.ndim - 2)
+        modulated = normalized * (1 + scale.view(broadcast_shape)) + shift.view(
+            broadcast_shape
+        )
+        return modulated, gate.view(broadcast_shape)
+
 
 class InstanceNorm(nn.Module):
     """Dimension-agnostic instance normalization layer for neural operators.

@@ -8,7 +8,7 @@ from neuralop.layers.conv_adapter import AdaptableSpectralConv
 
 from .channel_mlp import ChannelMLP
 from .complex import CGELU, ctanh, ComplexValued
-from .normalization_layers import AdaIN, BatchAdaIN, InstanceNorm, BatchNorm
+from .normalization_layers import AdaIN, AdaLNModulation, BatchAdaIN, InstanceNorm, BatchNorm
 from .skip_connections import skip_connection
 from .spectral_convolution import SpectralConv
 from ..utils import validate_scaling_factor
@@ -78,8 +78,14 @@ class FNOBlocks(nn.Module):
         Nonlinear activation function to use between layers, by default F.gelu
     stabilizer : Literal["tanh"], optional
         Stabilizing module to use between certain layers. Options: "tanh", None, by default None
-    norm : Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm", "batch_norm"], optional
-        Normalization layer to use. Options: "ada_in", "batch_ada_in", "group_norm", "instance_norm", "batch_norm", None, by default None
+    norm : Literal["ada_in", "batch_ada_in", "ada_ln", "group_norm", "instance_norm", "batch_norm"], optional
+        Normalization layer to use. Options: "ada_in", "batch_ada_in", "ada_ln", "group_norm", "instance_norm", "batch_norm", None, by default None
+        "ada_ln" uses a DiT-style (adaLN-Zero) block: pre-norm with per-sample conditioned
+        scale/shift and a conditioned gate on the conv and ChannelMLP branches. Embeddings
+        of shape (batch, ada_in_features) are set via ``set_ada_in_embeddings``.
+        Not compatible with ``preactivation=True`` or ``complex_data=True``.
+        To match DiT's identity residuals exactly, use ``fno_skip="identity"`` and
+        ``channel_mlp_skip="identity"``.
     norm_groups : int, optional
         Number of groups for GroupNorm, by default 1
     ada_in_features : int, optional
@@ -200,6 +206,12 @@ class FNOBlocks(nn.Module):
         self.preactivation = preactivation
         self.ada_in_features = ada_in_features
         self.enforce_hermitian_symmetry = enforce_hermitian_symmetry
+
+        self.coarsening_enabled = issubclass(conv_module, AdaptableSpectralConv)
+
+        # DiT-style adaLN-Zero: pre-norm + conditioned scale/shift + gated residual
+        self.use_ada_ln = norm == "ada_ln"
+
 
         # apply real nonlin if data is real, otherwise CGELU
         if self.complex_data:
@@ -353,18 +365,39 @@ class FNOBlocks(nn.Module):
                     for _ in range(n_layers * self.n_norms)
                 ]
             )
+
+        elif norm == "ada_ln":
+            self.norm = nn.ModuleList(
+                [
+                    AdaLNModulation(ada_in_features, out_channels)
+                    for _ in range(n_layers * self.n_norms)
+                ]
+            )
         else:
             raise ValueError(
                 f"Got norm={norm} but expected None or one of "
-                "[instance_norm, group_norm, batch_norm, ada_in, batch_ada_in]"
+                "[instance_norm, group_norm, batch_norm, ada_in, batch_ada_in, ada_ln]"
             )
 
         if self.complex_data and self.norm is not None:
             self.norm = nn.ModuleList([ComplexValued(x) for x in self.norm])
 
-        # Temporary flag to indicate whether the conv_module supports coarsening.
-        # This can be removed once all conv_modules support coarsening_level as a parameter in forward.
-        self.coarsening_enabled = issubclass(conv_module, AdaptableSpectralConv)
+        if self.use_ada_ln:
+            if in_channels != out_channels:
+                raise ValueError(
+                    "norm='ada_ln' requires in_channels == out_channels, "
+                    f"got {in_channels} and {out_channels}."
+                )
+            if preactivation:
+                raise ValueError("norm='ada_ln' does not support preactivation=True.")
+            if complex_data:
+                raise NotImplementedError(
+                    "norm='ada_ln' is not implemented for complex_data=True."
+                )
+            if self.coarsening_enabled:
+                raise NotImplementedError(
+                    "norm='ada_ln' is not implemented for coarsening_enabled=True."
+                )
 
     def set_ada_in_embeddings(self, *embeddings):
         """Sets the embeddings of each Ada-IN norm layers
@@ -384,6 +417,8 @@ class FNOBlocks(nn.Module):
                     norm.set_embedding(embedding)
 
     def forward(self, x, index=0, output_shape=None, coarsening_level=0):
+        if self.use_ada_ln:
+            return self.forward_with_postactivation_adaLN(x, index, output_shape, coarsening_level=coarsening_level)
         if self.preactivation:
             return self.forward_with_preactivation(x, index, output_shape, coarsening_level=coarsening_level)
         else:
@@ -479,6 +514,51 @@ class FNOBlocks(nn.Module):
                 x = self.channel_mlp[index](x) + x_skip_channel_mlp
             else:
                 x = self.channel_mlp[index](x)
+
+        return x
+
+    def forward_with_postactivation_adaLN(self, x, index=0, output_shape=None, coarsening_level=0):
+        """DiT-style block (adaLN-Zero) with the spectral conv in place of attention:
+
+            x = skip_fno(x) + gate_1 * conv(modulate(norm(x), shift_1, scale_1))
+            x = skip_mlp(x) + gate_2 * mlp(modulate(norm(x), shift_2, scale_2))
+
+        with non-linearities applied after each residual sum (except in the last layer).
+        Skips are computed from the unmodulated stream.
+        """
+        if self.fno_skips is not None:
+            x_skip_fno = self.fno_skips[index](x)
+            x_skip_fno = self.convs[index].transform(
+                x_skip_fno, output_shape=output_shape
+            )
+
+        if self.stabilizer == "tanh":
+            x = torch.tanh(x)
+
+        x, gate = self.norm[self.n_norms * index](x)
+
+  
+        x_fno = self.convs[index](x, output_shape=output_shape)
+
+        x_fno = gate * x_fno
+        x = x_fno + x_skip_fno if self.fno_skips is not None else x_fno
+
+        if index < (self.n_layers - 1):
+            x = self.non_linearity(x)
+
+        if self.use_channel_mlp:
+            # x is already at the output resolution: no transform needed here
+            if self.channel_mlp_skips is not None:
+                x_skip_channel_mlp = self.channel_mlp_skips[index](x)
+
+            x, gate = self.norm[self.n_norms * index + 1](x)
+            x = gate * self.channel_mlp[index](x)
+
+            if self.channel_mlp_skips is not None:
+                x = x + x_skip_channel_mlp
+
+            if index < (self.n_layers - 1):
+                x = self.non_linearity(x)
 
         return x
 

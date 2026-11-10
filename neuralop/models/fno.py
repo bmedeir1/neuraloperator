@@ -73,11 +73,17 @@ class FNO(BaseModel, name="FNO"):
         Default: "grid"
     non_linearity : nn.Module, optional
         Non-Linear activation function module to use. Default: F.gelu
-    norm : Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm"], optional
-        Normalization layer to use. Options: "ada_in", "batch_ada_in", "group_norm", "instance_norm", None. Default: None
+    norm : Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm", "ada_ln"], optional
+        Normalization layer to use. Options: "ada_in", "batch_ada_in", "group_norm", "instance_norm", "ada_ln", None. Default: None
         "ada_in" applies a single adaptive-norm embedding to every sample in the batch.
         "batch_ada_in" accepts one embedding per sample (shape (batch, ada_in_input_dim) for
         `ada_in` in `forward`), so adaptive-norm parameters can vary across the batch.
+        "ada_ln" uses DiT-style adaLN-Zero blocks: pre-norm with per-sample conditioned
+        scale/shift and conditioned gates on the spectral-conv and ChannelMLP branches
+        (see :class:`neuralop.layers.normalization_layers.AdaLNModulation`). Like
+        "batch_ada_in", it takes one embedding per sample: `ada_in` in `forward` must have
+        shape (batch, ada_in_input_dim). Not compatible with ``preactivation=True`` or
+        ``complex_data=True``.
     norm_groups : int, optional
         Number of groups for GroupNorm, by default 1
     complex_data : bool, optional
@@ -196,7 +202,7 @@ class FNO(BaseModel, name="FNO"):
         projection_channel_ratio: Number = 2,
         positional_embedding: Union[str, nn.Module] = "grid",
         non_linearity: nn.Module = F.gelu,
-        norm: Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm"] = None,
+        norm: Literal["ada_in", "batch_ada_in", "group_norm", "instance_norm", "ada_ln"] = None,
         norm_groups: int = 1,
         complex_data: bool = False,
         use_channel_mlp: bool = True,
@@ -304,7 +310,7 @@ class FNO(BaseModel, name="FNO"):
         self.resolution_scaling_factor = resolution_scaling_factor
 
         self.norm = norm
-        if self.norm in ("ada_in", "batch_ada_in"):
+        if self.norm in ("ada_in", "batch_ada_in", "ada_ln"):
             if (
                 ada_in_embed_frequencies is not None
                 and ada_in_pos_embed_type is not None
@@ -434,7 +440,12 @@ class FNO(BaseModel, name="FNO"):
         if self.domain_padding is not None:
             x = self.domain_padding.pad(x)
 
-        if self.norm in ("ada_in", "batch_ada_in"):
+        if self.norm in ("ada_in", "batch_ada_in", "ada_ln"):
+            if ada_in is None:
+                raise ValueError(
+                    f"FNO with norm='{self.norm}' requires the `ada_in` conditioning "
+                    "tensor to be passed to forward."
+                )
             if self.ada_in_pos_embed is not None:
                 if ada_in.ndim == 1:
                     # single embedding shared across every sample in the batch
