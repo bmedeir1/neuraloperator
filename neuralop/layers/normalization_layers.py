@@ -174,7 +174,11 @@ class AdaLNModulation(nn.Module):
 
         if mlp is None:
             mlp = nn.Sequential(
-                nn.Linear(embed_dim, 512), nn.GELU(), nn.Linear(512, 3 * in_channels)
+                nn.Linear(embed_dim, 512), 
+                nn.GELU(), 
+                nn.Linear(512, 256), 
+                nn.GELU(), 
+                nn.Linear(256, 3 * in_channels)
             )
             # adaLN-Zero: start with scale = shift = gate = 0
             nn.init.zeros_(mlp[-1].weight)
