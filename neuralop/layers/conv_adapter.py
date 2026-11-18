@@ -164,6 +164,8 @@ class MLPAdaptableSpectralConv(AdaptableSpectralConv):
         self.weight_transform = nn.Sequential(
             nn.Linear(self.total_modes, self.hidden_dim),
             nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
             nn.Linear(self.hidden_dim, self.total_modes),
         )
 
@@ -247,6 +249,8 @@ class MLPFactorizedChannelAdaptableSpectralConv(FactorizedChannelAdaptableSpectr
         hidden_dim = self.hidden_scale * n_channels
         return nn.Sequential(
             nn.Linear(n_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, n_channels),
         )
